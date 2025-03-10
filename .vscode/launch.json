@@ -17,7 +17,8 @@
         "cwd": "${workspaceFolder}",
         "jinja": true,
         "console": "integratedTerminal",
-        "justMyCode": true
+        "justMyCode": true,
+        "python": "${workspaceFolder}\\venv\\Scripts\\python.exe"
       }
     ]
   }
