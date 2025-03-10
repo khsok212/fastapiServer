@@ -33,10 +33,12 @@ def before_cursor_execute(conn, cursor, statement, parameters, context, executem
     print(parameters)
 
 # SQLite 데이터베이스 URL 설정(수정문제로 절대경로로 지정)
-DATABASE_URL = "sqlite:///T:\\khs\\work\\database\\test.db"
+# DATABASE_URL = "sqlite:///T:\\khs\\work\\database\\test.db"
+DATABASE_URL = "postgresql://postgres:1234@localhost/projectdb"
 
 # SQLAlchemy 엔진 생성
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False}, echo=True)
+# engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False}, echo=True)
+engine = create_engine(DATABASE_URL, echo=True)
 
 # 세션 생성
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

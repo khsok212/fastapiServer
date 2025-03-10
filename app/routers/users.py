@@ -9,7 +9,7 @@ from app.jwt import create_access_token, decode_access_token  # JWT 토큰 생�
 from datetime import timedelta, datetime
 from fastapi.security import OAuth2PasswordBearer  # OAuth2 패스워드 베어러 가져오기
 from jose import JWTError
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, cast, String
 from fastapi.responses import StreamingResponse
 from io import BytesIO
 
@@ -20,6 +20,9 @@ import pandas as pd
 router = APIRouter()
 logger = logging.getLogger(__name__)  # 로거 생성
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")  # OAuth2 스킴 생성
+
+
+ACCESS_TOKEN_EXPIRE_MINUTES = 30  # 30분
 
 # JWT 검증 함수
 def get_current_user_token(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
@@ -114,10 +117,6 @@ async def login(request: Request, response: Response, login_data: LoginRequest, 
         create_user_history(user_history, db)  # 실패 로그 기록
         raise HTTPException(status_code=401, detail="Invalid password")
 
-    # 로그인 성공 시 JWT 토큰 생성
-    access_token_expires = timedelta(minutes=30)  # 토큰 만료 시간 설정
-    access_token = create_access_token(data={"sub": user.user_id}, expires_delta=access_token_expires)
-
     # 권한 및 승인 여부 조회
     roles = (
         db.query(User, UserRole)
@@ -143,6 +142,10 @@ async def login(request: Request, response: Response, login_data: LoginRequest, 
     )
     create_user_history(user_history, db)  # 성공 로그 기록
 
+    # 로그인 성공 시 JWT 토큰 생성
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)  # 토큰 만료 시간 설정
+    access_token = create_access_token(data={"sub": user.user_id}, expires_delta=access_token_expires)
+
     # JWT를 쿠키에 설정 (HttpOnly, Secure, SameSite 설정)
     response.set_cookie(
         key="access_token",  # 쿠키 이름
@@ -152,7 +155,7 @@ async def login(request: Request, response: Response, login_data: LoginRequest, 
         secure=False,
         samesite="Lax",  # CSRF 공격 방지
         path="/",        # 모든 경로에서 접근 가능
-        max_age=1800,  # 30분
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,  # 30분
         domain="localhost",
     )
 
@@ -161,6 +164,7 @@ async def login(request: Request, response: Response, login_data: LoginRequest, 
         "user": UserSchema.from_orm(user),
         "roles": roles_data,  # roles 데이터를 반환
         "token_type": "bearer",  # 토큰 유형
+        "token_expire_min": ACCESS_TOKEN_EXPIRE_MINUTES
     }
 
 # 로그인 API
@@ -271,7 +275,8 @@ def read_all_users(
             User.address2,
             User.approval_status,
             User.created_at,
-            func.group_concat(UserRole.role_id).label('role_ids')
+            func.string_agg(cast(UserRole.role_id, String), ',').label('role_ids')
+            # func.group_concat(UserRole.role_id).label('role_ids')
         )
         .outerjoin(UserRole)
         .group_by(User.user_id)
