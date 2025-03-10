@@ -1,19 +1,24 @@
 {
-  "version": "0.2.0",
-  "configurations": [
+    "version": "0.2.0",
+    "configurations": [
       {
-          "name": "Python Debugger: FastAPI",
-          "type": "debugpy",  // 'python'에서 'debugpy'로 변경
-          "request": "launch",
-          "module": "uvicorn",
-          "args": [
-              "app:app",  // 'app' 폴더에서 FastAPI 객체 가져오기
-              "--reload"
-          ],
-          "cwd": "${workspaceFolder}",  // 작업 디렉토리를 프로젝트 루트로 설정
-          "jinja": true,
-          "console": "integratedTerminal",
-          "justMyCode": true
+        "name": "Python Debugger: FastAPI",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "uvicorn",
+        "args": [
+          "app:app",    // FastAPI 객체가 app.py(또는 __init__.py) 내에 있을 경우
+          "--reload",
+          "--host",
+          "localhost",  // <-- 호스트 설정
+          "--port",
+          "8000"        // <-- 포트 설정 (원하는 포트 번호)
+        ],
+        "cwd": "${workspaceFolder}",
+        "jinja": true,
+        "console": "integratedTerminal",
+        "justMyCode": true
       }
-  ]
-}
+    ]
+  }
+  

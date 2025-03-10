@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Request, Response
 from sqlalchemy.orm import Session
 from app.database.connection import get_db
 from app.database.models import User, UserRole, UserHistory, Blacklist
-from app.schemas.user import UserSchema, UserCreate, UserUpdate, LoginRequest, UserRoleList, UsersRequest, UserHistoryCreate, BlacklistBase  # Pydantic 스키마 가져오기
+from app.schemas.schemas import UserSchema, UserCreate, UserUpdate, LoginRequest, UserRoleList, UsersRequest, UserHistoryCreate, BlacklistBase, UserListResponseSchema, UserHistoryResponseSchema  # Pydantic 스키마 가져오기
 from app.utils.utils import verify_password  # 비밀번호 검증을 위한 유틸리티
 from app.utils.utils import hash_password  # 비밀번호 해싱을 위한 유틸리티
 from app.jwt import create_access_token, decode_access_token  # JWT 토큰 생성 함수 임포트
@@ -10,16 +10,19 @@ from datetime import timedelta, datetime
 from fastapi.security import OAuth2PasswordBearer  # OAuth2 패스워드 베어러 가져오기
 from jose import JWTError
 from sqlalchemy import func, or_
+from fastapi.responses import StreamingResponse
+from io import BytesIO
 
 import logging
 import re
+import pandas as pd
 
 router = APIRouter()
 logger = logging.getLogger(__name__)  # 로거 생성
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")  # OAuth2 스킴 생성
 
 # JWT 검증 함수
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+def get_current_user_token(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -38,6 +41,39 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         raise credentials_exception
     return user
 
+def get_current_user(request: Request, db: Session = Depends(get_db)):
+    token = request.cookies.get("access_token")
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="인증 토큰이 없습니다.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    try:
+        payload = decode_access_token(token)
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="유효하지 않은 토큰입니다.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    except (JWTError, Exception):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="토큰 검증 실패",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user = db.query(User).filter(User.user_id == user_id).first()
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="사용자를 찾을 수 없습니다.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user
+
 # 기본 루트 경로 추가
 @router.get("/")
 def root():
@@ -45,6 +81,90 @@ def root():
 
 # 로그인 API
 @router.post("/login/")
+async def login(request: Request, response: Response, login_data: LoginRequest, db: Session = Depends(get_db)):
+    # 차단된 IP 확인
+    blocked_user = db.query(Blacklist).filter(Blacklist.ip_address == request.client.host).first()
+    if blocked_user:
+        return {"message": "차단된 IP 사용자입니다.", "status": "block"}
+
+    # 사용자 조회
+    user = db.query(User).filter(User.user_id == login_data.user_id).first()
+
+    if user is None:
+        # 로그인 실패 로그 남기기
+        user_history = UserHistoryCreate(
+            user_id=login_data.user_id,
+            login_ip=request.client.host,
+            request_path=f"{request.method} {request.url.path}",
+            memo="로그인 실패 - 존재하지 않는 계정",
+            login_time=get_kst_now(),
+        )
+        create_user_history(user_history, db)  # 실패 로그 기록
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # 비밀번호 검증
+    if not verify_password(login_data.password, user.password):  # 비밀번호 해시 검증
+        user_history = UserHistoryCreate(
+            user_id=login_data.user_id,
+            login_ip=request.client.host,
+            request_path=f"{request.method} {request.url.path}",
+            memo="로그인 실패 - 비밀번호 해시 불일치",
+            login_time=get_kst_now(),
+        )
+        create_user_history(user_history, db)  # 실패 로그 기록
+        raise HTTPException(status_code=401, detail="Invalid password")
+
+    # 로그인 성공 시 JWT 토큰 생성
+    access_token_expires = timedelta(minutes=30)  # 토큰 만료 시간 설정
+    access_token = create_access_token(data={"sub": user.user_id}, expires_delta=access_token_expires)
+
+    # 권한 및 승인 여부 조회
+    roles = (
+        db.query(User, UserRole)
+        .join(UserRole, User.user_id == UserRole.user_id)
+        .filter(User.user_id == user.user_id)
+        .all()
+    )
+
+    logger.info(f"roles: {roles}")  # f-string 사용
+
+    # roles 리스트를 UserRoles 모델로 변환
+    roles_data = []
+    for user_obj, role_obj in roles:
+        roles_data.append(UserRoleList(role_id=role_obj.role_id))
+
+    # 로그인 성공 로그 기록
+    user_history = UserHistoryCreate(
+        user_id=login_data.user_id,
+        login_ip=request.client.host,
+        request_path=f"{request.method} {request.url.path}",
+        memo="로그인 성공",
+        login_time=get_kst_now(),
+    )
+    create_user_history(user_history, db)  # 성공 로그 기록
+
+    # JWT를 쿠키에 설정 (HttpOnly, Secure, SameSite 설정)
+    response.set_cookie(
+        key="access_token",  # 쿠키 이름
+        value=access_token,  # JWT 값
+        httponly=True,  # JavaScript에서 접근 불가
+        # secure=True,  # HTTPS 연결에서만 전송
+        secure=False,
+        samesite="Lax",  # CSRF 공격 방지
+        path="/",        # 모든 경로에서 접근 가능
+        max_age=1800,  # 30분
+        domain="localhost",
+    )
+
+    return {
+        "message": "로그인 성공",
+        "user": UserSchema.from_orm(user),
+        "roles": roles_data,  # roles 데이터를 반환
+        "token_type": "bearer",  # 토큰 유형
+    }
+
+# 로그인 API
+@router.post("/login/token")
 async def login(request: Request, login_data: LoginRequest, db: Session = Depends(get_db)):
 
     blocked_user = db.query(Blacklist).filter(Blacklist.ip_address == request.client.host).first()
@@ -126,7 +246,7 @@ async def login(request: Request, login_data: LoginRequest, db: Session = Depend
 #     )
 #     return users
 
-@router.get("/api/users/", response_model=list[UserSchema])
+@router.get("/api/users/", response_model=UserListResponseSchema)
 def read_all_users(
     request: Request,
     current_user: User = Depends(get_current_user),
@@ -136,7 +256,9 @@ def read_all_users(
     email: str = Query(None),
     phone: str = Query(None),
     approval_status: str = Query(None),
-    role_ids: str = Query(None)
+    role_ids: str = Query(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1)
 ):
   # 서브쿼리를 사용하여 group_concat 결과를 처리합니다.
     subquery = (
@@ -176,6 +298,11 @@ def read_all_users(
         role_conditions = [subquery.c.role_ids.like(f"%{role_id}%") for role_id in role_id_list]
         query = query.filter(or_(*role_conditions))  # 역할 필터링
 
+    # 전체 데이터 개수 (페이징 전)
+    total_count = query.count()
+
+    # 페이징 적용: offset & limit
+    query = query.offset((page - 1) * limit).limit(limit)
     users = query.all()
 
     # 반환할 데이터 형식에 맞게 변환
@@ -208,7 +335,10 @@ def read_all_users(
     # user_history를 DB에 삽입하는 로직 추가
     create_user_history(user_history, db)
     
-    return user_list
+    return {
+        "items": user_list,
+        "totalCount": total_count
+    }
 
 # 사용자 정보 조회
 @router.get("/api/user/{user_id}")
@@ -508,6 +638,146 @@ def get_user_history(
     
     return history
 
+# 접속 이력 조회
+@router.get("/api/newUserHistory", response_model=UserHistoryResponseSchema)
+def get_user_history(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    user_id: str = Query(None),
+    login_ip: str = Query(None),
+    request_path: str = Query(None),
+    memo: str = Query(None),
+    login_time: str = Query(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1),
+):
+    # 메인 쿼리
+    query = (
+        db.query(UserHistory)
+    )
+
+    # 필터 적용
+    if user_id:
+        query = query.filter(UserHistory.user_id.like(f"%{user_id}%"))
+    if login_ip:
+        query = query.filter(UserHistory.login_ip.like(f"%{login_ip}%"))
+    if request_path:
+        query = query.filter(UserHistory.request_path.like(f"%{request_path}%"))
+    if memo:
+        query = query.filter(UserHistory.memo.like(f"%{memo}%"))
+    if login_time:
+        try:
+            # 날짜를 datetime 객체로 변환
+            date_obj = datetime.strptime(login_time, "%Y-%m-%d")
+            # 날짜의 시작과 끝을 설정하여 필터링
+            query = query.filter(UserHistory.login_time >= date_obj, UserHistory.login_time < date_obj + timedelta(days=1))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+
+    # 전체 데이터 개수 (페이징 전)
+    total_count = query.count()
+
+    # login_time 기준 내림차순 정렬
+    query = query.order_by(UserHistory.login_time.desc())
+
+    # 페이징 적용: offset & limit
+    query = query.offset((page - 1) * limit).limit(limit)
+    history = query.all()
+
+    # UserHistory 객체 생성
+    user_history = UserHistoryCreate(
+        user_id=current_user.user_id,
+        login_time=get_kst_now(),
+        login_ip=request.client.host,
+        request_path=f"{request.method} {request.url.path}",
+        memo="접속 이력 - 접속 이력 조회 성공",
+    )
+
+    # user_history를 DB에 삽입하는 로직 추가
+    create_user_history(user_history, db)
+    
+    return {
+        "items": history,
+        "totalCount": total_count
+    }
+
+@router.get("/api/excelDownload")
+def download_excel(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    user_id: str = Query(None),
+    login_ip: str = Query(None),
+    request_path: str = Query(None),
+    memo: str = Query(None),
+    login_time: str = Query(None),
+):
+    # 메인 쿼리
+    query = db.query(UserHistory)
+
+    # 필터 적용
+    if user_id:
+        query = query.filter(UserHistory.user_id.like(f"%{user_id}%"))
+    if login_ip:
+        query = query.filter(UserHistory.login_ip.like(f"%{login_ip}%"))
+    if request_path:
+        query = query.filter(UserHistory.request_path.like(f"%{request_path}%"))
+    if memo:
+        query = query.filter(UserHistory.memo.like(f"%{memo}%"))
+    if login_time:
+        try:
+            date_obj = datetime.strptime(login_time, "%Y-%m-%d")
+            query = query.filter(
+                UserHistory.login_time >= date_obj,
+                UserHistory.login_time < date_obj + timedelta(days=1)
+            )
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+
+    # login_time 기준 내림차순 정렬
+    query = query.order_by(UserHistory.login_time.desc())
+
+    # 전체 데이터 조회 (페이징 없이)
+    history = query.all()
+
+    # 엑셀 파일 생성을 위해 데이터 변환
+    data = []
+    for idx, record in enumerate(history, start=1):
+        data.append({
+            "순번": idx,
+            "ID": record.user_id,
+            "접속 IP": record.login_ip,
+            "요청 경로": record.request_path,
+            "메모": record.memo,
+            "날짜": record.login_time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+    df = pd.DataFrame(data)
+    stream = BytesIO()
+    with pd.ExcelWriter(stream, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="접속이력")
+    stream.seek(0)
+
+    # 엑셀 다운로드에 대한 사용자 기록 남기기
+    user_history = UserHistoryCreate(
+        user_id=current_user.user_id,
+        login_time=get_kst_now(),
+        login_ip=request.client.host,
+        request_path=f"{request.method} {request.url.path}",
+        memo="엑셀 다운로드 - 접속 이력 다운로드 성공",
+    )
+    create_user_history(user_history, db)
+
+    headers = {
+        "Content-Disposition": "attachment; filename=history_download.xlsx"
+    }
+    return StreamingResponse(
+        stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers=headers,
+    )
+
 @router.post("/api/blockIp")
 def block_user(
     request: Request,
@@ -543,8 +813,7 @@ def block_user(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))  # 일반적인 예외 처리
 
-
-@router.post("/logout")
+@router.post("/logoutToken")
 def logout_user_history(request: Request, user_history: UserHistoryCreate, db: Session = Depends(get_db)):
     try:
             # UserHistory 객체 생성
@@ -560,6 +829,34 @@ def logout_user_history(request: Request, user_history: UserHistoryCreate, db: S
         create_user_history(user_history, db)
 
         return {"message": "로그아웃이 성공하였습니다.", "status" : "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/logout")
+def logout_user_history(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        # 현재 사용자의 로그아웃 이력을 기록합니다.
+        logout_history = UserHistoryCreate(
+            user_id=current_user.user_id,
+            login_time=get_kst_now(),
+            login_ip=request.client.host,
+            request_path=f"{request.method} {request.url.path}",
+            memo="로그아웃 성공",
+        )
+        create_user_history(logout_history, db)
+
+        # Response 객체를 생성하고 access_token 쿠키를 삭제합니다.
+        response = Response(
+            content='{"message": "로그아웃이 성공하였습니다.", "status": "ok"}',
+            media_type="application/json",
+        )
+        response.delete_cookie("access_token")
+        return response
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
