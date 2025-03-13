@@ -42,6 +42,8 @@ class RoleBase(BaseModel):
     role_id: int  # 권한 고유 ID
     role_name: str  # 권한 유형
 
+    class Config:
+        from_attributes = True
 class RoleCreate(RoleBase):
     pass
 
@@ -114,3 +116,44 @@ class UserRoleResponse(UserRoles):
 class LoginRequest(BaseModel):
     user_id: str
     password: str
+
+# 메뉴 권한 스키마 리스트
+class MenuSchema(BaseModel):
+    menu_id: int
+    menu_name: str
+    route: str
+    order_num: int
+    parent_id: Optional[int] = None
+    is_active: bool
+
+    class Config:
+        from_attributes = True
+
+class RoleMenuSchema(BaseModel):
+    role_id: int
+    menu_id: int
+
+    class Config:
+        from_attributes = True
+
+class MenuOrder(BaseModel):
+    menu_id: int
+    menu_order: int
+
+class UpdateRoleMenuRequest(BaseModel):
+    role_id: int
+    menu_items: List[MenuOrder]
+
+class MenuUpdate(BaseModel):
+    menu_name: str
+    route: str
+    is_active: bool
+
+    class Config:
+        from_attributes = True
+
+class MenuCreate(BaseModel):
+    menu_name: str
+    route: str
+    is_active: bool = True  # 기본값 활성화
+    parent_id: int | None = None  # 부모 메뉴 ID (선택 사항)

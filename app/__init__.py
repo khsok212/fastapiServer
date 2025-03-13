@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import users
+from app.routers import users, menu
 from app.database.connection import Base, engine
 from app.utils.logging import setup_logging  # 로깅 설정 함수 가져오기
 import httpx
@@ -49,3 +49,4 @@ Base.metadata.create_all(bind=engine)
 
 # 라우터 등록
 app.include_router(users.router)
+app.include_router(menu.router)

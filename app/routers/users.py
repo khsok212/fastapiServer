@@ -9,7 +9,7 @@ from app.jwt import create_access_token, decode_access_token  # JWT 토큰 생�
 from datetime import timedelta, datetime
 from fastapi.security import OAuth2PasswordBearer  # OAuth2 패스워드 베어러 가져오기
 from jose import JWTError
-from sqlalchemy import func, or_, cast, String
+from sqlalchemy import func, or_, cast, String, text
 from fastapi.responses import StreamingResponse
 from io import BytesIO
 
@@ -130,7 +130,7 @@ async def login(request: Request, response: Response, login_data: LoginRequest, 
     # roles 리스트를 UserRoles 모델로 변환
     roles_data = []
     for user_obj, role_obj in roles:
-        roles_data.append(UserRoleList(role_id=role_obj.role_id))
+        roles_data.append(role_obj.role_id)
 
     # 로그인 성공 로그 기록
     user_history = UserHistoryCreate(
@@ -223,7 +223,7 @@ async def login(request: Request, login_data: LoginRequest, db: Session = Depend
     # roles 리스트를 UserRoles 모델로 변환
     roles_data = []
     for user_obj, role_obj in roles:
-        roles_data.append(UserRoleList(role_id=role_obj.role_id))
+        roles_data.append(role_obj.role_id)
 
     user_history = UserHistoryCreate(
             user_id=login_data.user_id,
